@@ -1,0 +1,4 @@
+project_name,project_life,initial_investment,annual_revenues,operating_costs,tax_rate,discount_rate,working_capital,terminal_value,financing_rate,reinvestment_rate,growth_rate
+Solar Plant Expansion,12,2500000,700000,160000,25,9.5,80000,500000,9.5,9.5,3.0
+Logistics Fleet Renewal,8,1500000,390000,210000,22,11,40000,200000,11,11,0
+New Retail Outlet,10,800000,200000,150000,24,12,30000,0,12,12,2.5
