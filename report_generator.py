@@ -602,3 +602,267 @@ def decision_final(results: dict[str, Any], risk_results: dict[str, Any]) -> dic
         )
 
     return {"decision": decision, "reason": reason, "recommendation": recommendation}
+
+
+# ---------------------------------------------------------------------------
+# Three-Project Multi-Currency comparison report (PDF, landscape)
+# ---------------------------------------------------------------------------
+
+def _ccy_money(v, ccy: str) -> str:
+    if v is None or v != v:
+        return "N/A"
+    return f"{ccy}{v:,.0f}"
+
+
+def _ccy_num(v, digits: int = 2, suffix: str = "") -> str:
+    if v is None or v != v:
+        return "N/A"
+    return f"{v:,.{digits}f}{suffix}"
+
+
+def _ts_display(ts) -> str:
+    if ts is None:
+        return "N/A"
+    s = ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
+    return s[:19].replace("T", " ")
+
+
+def build_three_project_pdf_report(result: dict[str, Any]) -> bytes:
+    """Render the full comparison -> ranking -> optimization -> recommendation.
+
+    The final report must state, for every project: Rate Used | Source | Timestamp |
+    Live or Manual — plus WHAT/WHY/EVIDENCE/RISKS/ACTION for the winner.
+    """
+    config = result["config"]
+    comparison_currency = config.comparison_currency
+    ccy = fx_labels().get(comparison_currency, comparison_currency)
+    comp_df = result["comparison_df"].sort_values("Project").reset_index(drop=True)
+    ranking_df = result["ranking_df"]
+    optimisation = result["optimisation"]
+    rec = result["recommendation"]
+    executed = result["executed"]
+    rates_text = result["rates_text"]
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf,
+        pagesize=landscape(A4),
+        rightMargin=0.4 * inch,
+        leftMargin=0.4 * inch,
+        topMargin=0.5 * inch,
+        bottomMargin=0.5 * inch,
+    )
+    styles = getSampleStyleSheet()
+    styles.add(
+        ParagraphStyle(
+            name="FTitle",
+            parent=styles["Title"],
+            alignment=TA_CENTER,
+            fontSize=16,
+            fontName="Helvetica-Bold",
+        )
+    )
+    styles.add(ParagraphStyle(name="H2", parent=styles["Heading2"], fontSize=11, spaceAfter=6))
+    body = styles["BodyText"]
+    body.fontName = "Helvetica"
+    body.fontSize = 8.5
+
+    flow = []
+    flow.append(Paragraph("Three-Project Multi-Currency Decision Report", styles["FTitle"]))
+    flow.append(Spacer(1, 6))
+    flow.append(Paragraph(f"<b>Generated:</b> {datetime.now().strftime('%d %b %Y, %H:%M')} | <b>Comparison currency:</b> {comparison_currency}", body))
+    flow.append(Spacer(1, 8))
+
+    # 1. Projects under review
+    flow.append(Paragraph("1. Projects Under Review", styles["H2"]))
+    proj_rows = [["Project", "Name", "Source Currency", "Description"]]
+    for key in ("A", "B", "C"):
+        spec = config.projects[key]
+        proj_rows.append(
+            [key, spec.name, fx_labels().get(spec.currency, spec.currency),
+             (spec.description or "")[:90]]
+        )
+    t = Table(proj_rows, colWidths=[0.8 * inch, 2.2 * inch, 1.4 * inch, 8.4 * inch])
+    t.setStyle(_table_style())
+    flow.append(t)
+    flow.append(Spacer(1, 8))
+
+    # 2. Exchange rates used (Rate | Source | Timestamp | Live or Manual)
+    flow.append(Paragraph("2. Exchange Rates Used", styles["H2"]))
+    flow.append(
+        Paragraph(
+            "Every monetary input was converted from its source currency to the comparison "
+            "currency using the rates below. Manual overrides take priority over live rates; "
+            "live rates are marked LIVE, manual rates are marked MANUAL, and stored-but-stale "
+            "rates are labelled STALE. A rate is never used silently when it is outdated.",
+            body,
+        )
+    )
+    rate_rows = [["Pair", "Rate Used", "Source", "Timestamp", "Live or Manual", "Status"]]
+    for pair, fr in result["rates"].items():
+        rate_rows.append(
+            [
+                pair,
+                _ccy_num(fr.rate, 6),
+                fr.source or "stored",
+                _ts_display(fr.ts),
+                str(fr.status),
+                str(fr.status),
+            ]
+        )
+    t = Table(rate_rows, colWidths=[1.2 * inch, 1.2 * inch, 3.2 * inch, 2.2 * inch, 2.0 * inch, 1.8 * inch])
+    t.setStyle(_table_style())
+    flow.append(t)
+    flow.append(Spacer(1, 8))
+
+    # 3. Comparison of results
+    flow.append(Paragraph("3. Comparison of Results", styles["H2"]))
+    comp_cols = [
+        "Project",
+        "DCF Value",
+        "NPV",
+        "IRR",
+        "MIRR",
+        "ROI",
+        "Holding Period Return",
+        "Annualized Return",
+        "Payback",
+        "Profitability Index",
+        "WACC",
+        "Overall Risk",
+        "Best Case NPV",
+        "Base Case NPV",
+        "Worst Case NPV",
+    ]
+    cmp_rows = [comp_cols]
+    for _, r in comp_df.iterrows():
+        cmp_rows.append(
+            [
+                r["Project"],
+                _ccy_money(r["DCF Value"], ccy),
+                _ccy_money(r["NPV"], ccy),
+                _ccy_num(r["IRR"], 2, "%"),
+                _ccy_num(r["MIRR"], 2, "%"),
+                _ccy_num(r["ROI"], 2, "%"),
+                _ccy_num(r["Holding Period Return"], 2, "%"),
+                _ccy_num(r["Annualized Return"], 2, "%"),
+                _ccy_num(r["Payback"], 2, " yr"),
+                _ccy_num(r["Profitability Index"], 3),
+                _ccy_num(r["WACC"], 2, "%"),
+                str(r["Risk"]),
+                _ccy_money(r["Best Case NPV"], ccy),
+                _ccy_money(r["Base Case NPV"], ccy),
+                _ccy_money(r["Worst Case NPV"], ccy),
+            ]
+        )
+    t = Table(cmp_rows, colWidths=[0.7 * inch, 1.15 * inch, 1.15 * inch, 0.9 * inch, 0.9 * inch, 0.9 * inch, 1.1 * inch, 1.2 * inch, 0.9 * inch, 0.95 * inch, 0.7 * inch, 0.8 * inch, 1.1 * inch, 1.1 * inch, 1.1 * inch])
+    t.setStyle(_table_style())
+    flow.append(t)
+    flow.append(Spacer(1, 8))
+
+    # 4. Ranking
+    flow.append(Paragraph("4. Ranking (1st to 3rd)", styles["H2"]))
+    rank_rows = [["Rank", "Project", "Name", "Composite Score", "Risk", "Explanation"]]
+    for _, r in ranking_df.iterrows():
+        rank_rows.append(
+            [
+                str(int(r["Rank"])),
+                r["Project"],
+                r["Name"],
+                _ccy_num(r["Composite Score"], 4),
+                str(r["Risk"]),
+                rec.get(f"explanation_rank{int(r['Rank'])}", ""),
+            ]
+        )
+    t = Table(rank_rows, colWidths=[0.7 * inch, 0.7 * inch, 2.0 * inch, 1.4 * inch, 1.0 * inch, 8.0 * inch])
+    t.setStyle(_table_style())
+    flow.append(t)
+    flow.append(Spacer(1, 8))
+
+    # 5. Optimization
+    flow.append(Paragraph("5. Capital Optimisation", styles["H2"]))
+    flow.append(Paragraph(
+        f"Investment type: <b>{optimisation['type']}</b>. Budget: "
+        f"{_ccy_money(getattr(config, 'budget', 0), ccy)}. {optimisation['explanation']}",
+        body,
+    ))
+    if optimisation["type"] == "Divisible":
+        alloc = optimisation["allocation_df"]
+        alloc_rows = [["Project", "NPV", "Investment", "Allocated", "Portion %", "NPV Contribution"]]
+        for _, r in alloc.iterrows():
+            alloc_rows.append(
+                [
+                    r["Project"],
+                    _ccy_money(r["NPV"], ccy),
+                    _ccy_money(r["Investment"], ccy),
+                    _ccy_money(r["Allocated"], ccy),
+                    _ccy_num(r["Portion %"], 1, "%"),
+                    _ccy_money(r["NPV Contribution"], ccy),
+                ]
+            )
+        t = Table(alloc_rows, colWidths=[0.9 * inch, 1.6 * inch, 1.6 * inch, 1.6 * inch, 1.2 * inch, 1.6 * inch])
+    else:
+        comb = optimisation["combinations_df"]
+        comb_rows = [["Combination", "Investment", "Total NPV", "Within Budget"]]
+        for _, r in comb.iterrows():
+            comb_rows.append(
+                [
+                    r["Combination"],
+                    _ccy_money(r["Investment"], ccy),
+                    _ccy_money(r["Total NPV"], ccy),
+                    "Yes" if r["Feasible"] else "No",
+                ]
+            )
+        t = Table(comb_rows, colWidths=[2.4 * inch, 2.4 * inch, 2.4 * inch, 2.4 * inch])
+    t.setStyle(_table_style())
+    flow.append(t)
+    flow.append(Spacer(1, 8))
+
+    # 6. Final Recommendation (WHAT won -> WHY -> EVIDENCE -> RISKS -> WHAT MANAGEMENT SHOULD DO)
+    flow.append(Paragraph("6. Final Recommendation", styles["H2"]))
+    flow.append(Paragraph(f"<b>WHAT WON</b>: {rec['what']}", body))
+    flow.append(Paragraph(f"<b>WHY</b>: {rec['why']}", body))
+    flow.append(Paragraph("<b>EVIDENCE</b>", body))
+    flow.append(
+        ListFlowable(
+            [ListItem(Paragraph(e, body)) for e in rec["evidence"]],
+            bulletType="bullet",
+        )
+    )
+    flow.append(Paragraph(f"<b>RISKS</b>: {rec['risks']}", body))
+    flow.append(Paragraph(f"<b>WHAT MANAGEMENT SHOULD DO</b>: {rec['action']}", body))
+    flow.append(
+        Paragraph(
+            "Method note: no currency (USD, ZAR or ZiG) is treated as inherently superior. All "
+            "monetary values are compared in the single comparison currency after conversion; "
+            "scale-independent metrics (IRR, MIRR, ROI, payback, PI) are unaffected by currency choice.",
+            body,
+        )
+    )
+
+    # 7. Rates audit trail
+    flow.append(Paragraph("7. Exchange-Rate Audit Trail", styles["H2"]))
+    for line in rates_text:
+        flow.append(Paragraph(line, body, bulletText="-"))
+
+    # 8. Limitations
+    flow.append(Paragraph("8. Limitations", styles["H2"]))
+    flow.append(
+        Paragraph(
+            "Model-based decision aid, not investment advice. Results depend on input accuracy and on "
+            "the exchange rates and market assumptions in force at the time of the analysis. Exchange "
+            "rates move continuously; re-run the comparison when USD/ZAR/ZiG rates change materially. "
+            "Terminal value, growth and discount-rate assumptions materially affect outcomes.",
+            body,
+        )
+    )
+
+    doc.build(flow)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def fx_labels() -> dict[str, str]:
+    from fx_rates import CCY_LABELS
+
+    return CCY_LABELS

@@ -6,6 +6,7 @@ Run:  streamlit run app.py
 from __future__ import annotations
 
 import io
+import time
 from typing import Any
 
 import numpy as np
@@ -16,7 +17,9 @@ from plotly.subplots import make_subplots
 
 import data_validation as dv
 import email_service
+import fx_rates as fx
 import report_generator as rg
+import three_project as tp
 from calculations import (
     ProjectInputs,
     decision_for_irr,
@@ -628,10 +631,404 @@ def render_workflow_summary():
     )
 
 
-def main():
-    st.title("Financial Engineering Investment Decision Agent")
-    st.caption("Industry-independent capital budgeting, DCF, risk, scenario and decision engine.")
+# ---------------------------------------------------------------------------
+# Tab 2 — Live Exchange Rate Board (USD / ZAR / ZiG)
+# ---------------------------------------------------------------------------
 
+def _fx_session_ratemap() -> dict[str, fx.FxRate]:
+    return st.session_state.setdefault("fx_ratemap", {})
+
+
+def _refresh_fx(fetch: bool = False, show_feedback: bool = True) -> None:
+    st.session_state.setdefault("fx_ratemap", {})
+    st.session_state.setdefault("fx_last_fetch", 0.0)
+    if fetch:
+        with st.spinner("Fetching live exchange rates..."):
+            live = fx.fetch_live_rates()
+        if live:
+            fx.store_live_rates(live)
+            st.session_state["fx_ratemap"] = live
+            st.session_state["fx_last_fetch"] = time.time()
+            if show_feedback:
+                st.success(f"Live rates updated from {next(iter(live.values())).source}.")
+        else:
+            forumla = fx.all_effective_rates(_fx_session_ratemap())
+            st.session_state["fx_ratemap"] = forumla
+            if show_feedback:
+                st.warning(
+                    "Live rate unavailable (network or provider down). The board now shows stored "
+                    "rates (labelled STORED/STALE) or manual overrides — never a silently outdated rate."
+                )
+    else:
+        ratemap = st.session_state.get("fx_ratemap")
+        if not ratemap:
+            st.session_state["fx_ratemap"] = fx.all_effective_rates()
+
+
+def _maybe_autorefresh(interval_minutes: float) -> None:
+    if interval_minutes <= 0:
+        return
+    last = float(st.session_state.get("fx_last_fetch", 0.0))
+    if last <= 0:
+        return  # no fresh fetch yet this session; wait for a manual refresh or button click
+    if time.time() - last >= interval_minutes * 60:
+        _refresh_fx(fetch=True, show_feedback=False)
+
+
+def render_fx_board():
+    st.subheader("Live Exchange Rate Board — USD / ZAR / ZiG")
+    st.caption(
+        "All six currency pairs. Live source: open.er-api.com (fallback: frankfurter.app/ECB). "
+        "Manual overrides and stored-rate history are explicitly labelled; an outdated stored rate "
+        "is never silently used (it is shown as STALE)."
+    )
+
+    c1, c2 = st.columns([2, 1])
+    interval = c1.select_slider(
+        "Auto-refresh interval",
+        options=[0, 5, 10, 15, 30, 60],
+        value=int(st.session_state.get("fx_interval", 15)),
+        format_func=lambda v: "Off" if v == 0 else f"Every {v} minutes",
+    )
+    st.session_state["fx_interval"] = int(interval)
+    if c2.button("Refresh Live Rates Now", type="primary"):
+        _refresh_fx(fetch=True)
+
+    _maybe_autorefresh(int(interval))
+    ratemap = _fx_session_ratemap()
+    if not ratemap:
+        _refresh_fx(fetch=False)
+
+    board = fx.build_board_frame(ratemap)
+    st.dataframe(board, width="stretch")
+    st.caption(
+        "Status legend — LIVE: fresh from provider · MANUAL OVERRIDE: user-entered, always wins · "
+        "STORED: last fetched value, still valid · STALE: stored value older than 24h · UNAVAILABLE: no rate."
+    )
+
+    # Manual overrides
+    with st.expander("Manual Rate Overrides", expanded=False):
+        st.caption(
+            "A manual override takes priority over live and stored rates and is marked "
+            "MANUAL OVERRIDE in every report. Use it when you have a better rate than the provider."
+        )
+        pairs = [f"{a}/{b}" for a, b in fx.PAIRS]
+        o1, o2, o3 = st.columns([2, 2, 1])
+        override_pair = o1.selectbox("Pair", pairs, key="fx_ov_pair")
+        override_rate = o2.number_input(
+            f"Manual rate for {override_pair}",
+            min_value=0.0000001,
+            value=float(st.session_state.get("fx_ov_val", 1.0)),
+            step=0.01,
+            format="%.6f",
+            key="fx_ov_rate",
+        )
+        st.session_state["fx_ov_val"] = override_rate
+        o3.markdown("")
+        b1, b2 = st.columns(2)
+        if b1.button("Set Manual Override"):
+            try:
+                fx.set_manual_override(override_pair, float(override_rate))
+                st.success(f"Manual override stored for {override_pair} = {override_rate:,.6f}.")
+                _refresh_fx(fetch=False)
+            except Exception as exc:  # noqa: BLE001
+                st.error(str(exc))
+        if b2.button("Clear Manual Override"):
+            fx.clear_manual_override(override_pair)
+            st.success(f"Manual override cleared for {override_pair}.")
+            _refresh_fx(fetch=False)
+
+    with st.expander("Rate History (audit trail)", expanded=False):
+        limit = st.slider("History rows", min_value=5, max_value=200, value=30, step=5)
+        hist = fx.get_history(limit=min(limit, 200))
+        if hist:
+            st.dataframe(
+                pd.DataFrame(hist).rename(columns={"pair": "Pair", "rate": "Rate", "source": "Source", "status": "Status", "ts": "Timestamp"}),
+                width="stretch",
+            )
+        else:
+            st.info("No rate history recorded yet. Fetch live rates to populate the audit trail.")
+
+
+# ---------------------------------------------------------------------------
+# Tab 3 — Three-Project Multi-Currency Comparison & Optimisation
+# ---------------------------------------------------------------------------
+
+def _tp_ratemap_ready(config: tp.ComparisonConfig) -> list[str]:
+    """Return list of missing pair descriptions; empty when everything can convert."""
+    missing = []
+    currencies = [p.currency for p in config.projects.values()]
+    currencies.append(config.comparison_currency)
+    for ccy in set(currencies):
+        if ccy == config.comparison_currency:
+            continue
+        direct = f"{ccy}/{config.comparison_currency}"
+        inverse = f"{config.comparison_currency}/{ccy}"
+        has_direct = config.ratemap.get(direct) is not None and config.ratemap.get(direct).rate == config.ratemap.get(direct).rate
+        has_inv = config.ratemap.get(inverse) is not None and config.ratemap.get(inverse).rate == config.ratemap.get(inverse).rate
+        ok = has_direct or has_inv
+        if ccy != "USD" and not ok:
+            via = f"{ccy}/USD"
+            vu = f"USD/{config.comparison_currency}" if config.comparison_currency != "USD" else None
+            has_via = config.ratemap.get(via) is not None and config.ratemap.get(via).rate == config.ratemap.get(via).rate
+            has_vu = vu is None or (config.ratemap.get(vu) is not None and config.ratemap.get(vu).rate == config.ratemap.get(vu).rate)
+            ok = has_via and has_vu
+        if not ok:
+            missing.append(f"{ccy} → {config.comparison_currency}")
+    return list(dict.fromkeys(missing))
+
+
+def _tp_spec_from_widgets(letter: str, name: str) -> tp.ProjectSpec:
+    k = letter.lower()
+    return tp.ProjectSpec(
+        name=name,
+        description=str(st.session_state.get(f"{k}_desc", "")),
+        currency=str(st.session_state[f"{k}_ccy"]),
+        initial_investment=float(st.session_state[f"{k}_inv"]),
+        annual_revenues=float(st.session_state[f"{k}_rev"]),
+        operating_costs=float(st.session_state[f"{k}_cost"]),
+        tax_rate=float(st.session_state[f"{k}_tax"]),
+        discount_rate=float(st.session_state[f"{k}_disc"]),
+        financing_rate=float(st.session_state[f"{k}_fin"]),
+        reinvestment_rate=float(st.session_state[f"{k}_rein"]),
+        project_life=float(st.session_state[f"{k}_life"]),
+        working_capital=float(st.session_state[f"{k}_wc"]),
+        terminal_value=float(st.session_state[f"{k}_tv"]),
+        revenue_growth_rate=float(st.session_state[f"{k}_revg"]),
+        cost_growth_rate=float(st.session_state[f"{k}_costg"]),
+        terminal_growth_rate=float(st.session_state[f"{k}_tvg"]),
+    )
+
+
+def _tp_input_player(letter: str):
+    k = letter.lower()
+    name = st.text_input(f"Project {letter} — name", f"Project {letter}", key=f"{k}_name")
+    st.caption("All monetary inputs below are in the project's own currency.")
+    c1, c2 = st.columns(2)
+    with c1:
+        ccy = st.selectbox(
+            "Project currency",
+            fx.CURRENCIES,
+            format_func=lambda c: fx.CCY_LABELS[c],
+            key=f"{k}_ccy",
+        )
+        inv = st.number_input("Initial investment", min_value=0.0, value=1_000_000.0, step=50_000.0, format="%.0f", key=f"{k}_inv")
+        rev = st.number_input("Annual revenues", min_value=0.0, value=350_000.0, step=10_000.0, format="%.0f", key=f"{k}_rev")
+        cost = st.number_input("Operating costs", min_value=0.0, value=80_000.0, step=10_000.0, format="%.0f", key=f"{k}_cost")
+        tax = st.number_input("Tax rate (%)", min_value=0.0, max_value=100.0, value=25.0, step=0.5, key=f"{k}_tax")
+        disc = st.number_input("Discount rate / WACC (%)", min_value=0.01, max_value=100.0, value=10.0, step=0.5, key=f"{k}_disc")
+        fin = st.number_input("Financing rate (%)", min_value=0.01, max_value=100.0, value=10.0, step=0.5, key=f"{k}_fin")
+    with c2:
+        life = st.number_input("Project life (years)", min_value=1.0, max_value=100.0, value=10.0, step=1.0, key=f"{k}_life")
+        rein = st.number_input("Reinvestment rate (%)", min_value=0.01, max_value=100.0, value=10.0, step=0.5, key=f"{k}_rein")
+        wc = st.number_input("Initial working capital", min_value=0.0, value=0.0, step=10_000.0, format="%.0f", key=f"{k}_wc")
+        tv = st.number_input("Terminal value", min_value=0.0, value=0.0, step=50_000.0, format="%.0f", key=f"{k}_tv")
+        revg = st.number_input("Revenue growth (%/yr)", value=0.0, step=0.5, key=f"{k}_revg")
+        costg = st.number_input("Cost growth (%/yr)", value=0.0, step=0.5, key=f"{k}_costg")
+        tvg = st.number_input("Terminal growth (%/yr)", value=0.0, step=0.25, key=f"{k}_tvg")
+    desc = st.text_area(f"Project {letter} — description", height=60, key=f"{k}_desc")
+
+
+def _render_tp_result(out: dict[str, Any], ccy: str):
+    rec = out["recommendation"]
+    comp_df = out["comparison_df"].sort_values("Project").reset_index(drop=True)
+    ranking = out["ranking_df"]
+    optimism = out["optimisation"]
+
+    st.subheader("Comparison of Results")
+    show_cols = [
+        "Project", "Name", "DCF Value", "NPV", "IRR", "MIRR", "ROI", "Holding Period Return",
+        "Annualized Return", "Payback", "Profitability Index", "WACC", "Risk", "Base Case NPV",
+    ]
+    st.dataframe(comp_df[show_cols], width="stretch")
+
+    st.subheader("Ranking (1st → 3rd)")
+    st.dataframe(ranking[["Rank", "Project", "Name", "Composite Score", "Risk"]], width="stretch")
+    for _, r in ranking.iterrows():
+        st.markdown(
+            f"""<div class="metric-card {"accept" if int(r["Rank"]) == 1 else "review"}">
+            <h4>{int(r['Rank'])}{'st' if int(r['Rank'])==1 else 'nd' if int(r['Rank'])==2 else 'rd'} — Project {r['Project']} ({r['Name']}) · Score {r['Composite Score']:.3f} · Risk {r['Risk']}</h4>
+            <p>{rec.get(f'explanation_rank{int(r["Rank"])}', '')}</p>
+            </div>""",
+            unsafe_allow_html=True,
+        )
+
+    st.subheader(f"Capital Optimisation — {optimism['type']}")
+    st.markdown(optimism["explanation"])
+    if optimism["type"] == "Divisible":
+        st.dataframe(optimism["allocation_df"], width="stretch")
+    else:
+        st.dataframe(optimism["combinations_df"], width="stretch")
+        st.markdown(f"**Best combination: {optimism.get('best_combination') or 'none within budget'}**")
+
+    st.subheader("Final Recommendation")
+    st.markdown(f"**WHAT WON:** {rec['what']}")
+    st.markdown(f"**WHY:** {rec['why']}")
+    st.markdown("**EVIDENCE:**")
+    for e in rec["evidence"]:
+        st.markdown(f"- {e}")
+    st.markdown(f"**RISKS:** {rec['risks']}")
+    st.markdown(f"**WHAT MANAGEMENT SHOULD DO:** {rec['action']}")
+    st.info(
+        "Method note: no currency (USD, ZAR or ZiG) is treated as inherently superior. Monetary "
+        "values are compared in a single comparison currency after conversion; scale-independent "
+        "metrics (IRR, MIRR, ROI, payback, PI) do not depend on the currency choice."
+    )
+
+    st.subheader("Exchange Rates Used")
+    st.markdown("Every monetary input was converted using the rates below. Manual overrides and "
+                "live/stored status are stated explicitly.")
+    rate_rows = []
+    for pair, fr in out["rates"].items():
+        rate_rows.append(
+            {
+                "Currency Pair": pair,
+                "Rate Used": (None if fr.rate != fr.rate else fr.rate),
+                "Source": fr.source,
+                "Timestamp": (str(fr.ts)[:19].replace("T", " ") if fr.ts else "N/A"),
+                "Live or Manual": fr.status,
+            }
+        )
+    st.dataframe(pd.DataFrame(rate_rows), width="stretch")
+
+    st.subheader("Management Report & Email")
+    rcol1, rcol2 = st.columns(2)
+    pdf_bytes = rg.build_three_project_pdf_report(out)
+    rcol1.download_button(
+        "Download Three-Project PDF Report",
+        data=pdf_bytes,
+        file_name="three_project_comparison_report.pdf",
+        mime="application/pdf",
+    )
+
+    with st.expander("Email the comparison report", expanded=False):
+        env_default = email_service.default_smtp_from_env()
+        e1, e2 = st.columns(2)
+        smtp_host = e1.text_input("SMTP Host", env_default.get("host", ""), key="tp_smtp_host")
+        smtp_port = e2.text_input("SMTP Port", env_default.get("port", "587"), key="tp_smtp_port")
+        smtp_user = e1.text_input("SMTP Username", env_default.get("username", ""), key="tp_smtp_user")
+        smtp_pass = e2.text_input("SMTP Password", env_default.get("password", ""), type="password", key="tp_smtp_pass")
+        smtp_from = st.text_input("From address", env_default.get("from_addr", ""), key="tp_smtp_from")
+        tc1, tc2 = st.columns([2, 1])
+        to_email = tc1.text_input("Recipient email (any address)", key="tp_to")
+        subject = tc2.text_input("Subject", "Three-Project Comparison Report", key="tp_subject")
+        body = st.text_area(
+            "Email message",
+            (
+                f"{rec['what']}\n\n{rec['why']}\n\nRISKS: {rec['risks']}\n\n"
+                f"WHAT MANAGEMENT SHOULD DO: {rec['action']}\n\n"
+                f"Rates used and full evidence are in the attached PDF report."
+            ),
+            height=200,
+            key="tp_body",
+        )
+        if st.button("Send Comparison Report Email", type="primary"):
+            if not to_email or "@" not in to_email or "." not in to_email:
+                st.error("Please provide a valid recipient email address.")
+            else:
+                ok, msg = email_service.send_email(
+                    to_email=to_email,
+                    subject=subject,
+                    body_text=body,
+                    attachments=[("three_project_comparison_report.pdf", pdf_bytes)],
+                    smtp_config={
+                        "host": smtp_host,
+                        "port": smtp_port,
+                        "username": smtp_user,
+                        "password": smtp_pass,
+                        "from_addr": smtp_from,
+                    },
+                )
+                if ok:
+                    st.success(msg)
+                else:
+                    st.error(msg)
+
+
+def render_three_project():
+    st.subheader("Three-Project Comparison & Optimisation")
+    st.caption(
+        "Compare Projects A, B and C in USD / ZAR / ZiG. All monetary inputs are converted into one "
+        "comparison currency using the Exchange Rate Board schedules before analysis."
+    )
+
+    with st.expander("Comparison Configuration", expanded=True):
+        ccfg = st.columns(3)
+        comparison_currency = ccfg[0].selectbox(
+            "Comparison currency",
+            fx.CURRENCIES,
+            index=0,
+            format_func=lambda c: fx.CCY_LABELS[c],
+            key="tp_cmpccy",
+        )
+        investment_type = ccfg[1].selectbox(
+            "Investment type",
+            ["Divisible", "Indivisible"],
+            index=0,
+            key="tp_invtype",
+        )
+        budget = ccfg[2].number_input(
+            f"Investment budget ({comparison_currency})",
+            min_value=0.0,
+            value=0.0,
+            step=100_000.0,
+            format="%.0f",
+            key="tp_budget",
+        )
+        methods_sel = st.multiselect(
+            "Financial methods used for ranking",
+            tp.METHODS,
+            default=["NPV", "IRR", "MIRR", "ROI", "PI", "Payback"],
+            key="tp_methods",
+        )
+        include_risk = st.checkbox("Include risk & scenario analysis in the ranking", value=True, key="tp_risk")
+
+    st.markdown("#### Project Inputs (each in its own currency)")
+    for letter in ("A", "B", "C"):
+        with st.expander(f"Project {letter} — Inputs", expanded=True if letter == "A" else False):
+            _tp_input_player(letter)
+
+    if st.button("Run Comparison", type="primary"):
+        if not methods_sel:
+            st.error("Select at least one financial method.")
+        else:
+            ratemap = fx.all_effective_rates(_fx_session_ratemap())
+            specs = {
+                letter: _tp_spec_from_widgets(letter, str(st.session_state.get(f"{letter.lower()}_name", f"Project {letter}")))
+                for letter in ("A", "B", "C")
+            }
+            config = tp.ComparisonConfig(
+                projects=specs,
+                comparison_currency=comparison_currency,
+                methods=methods_sel,
+                include_risk_and_scenarios=include_risk,
+                investment_type=investment_type,
+                budget=float(budget),
+                ratemap=ratemap,
+            )
+            missing = _tp_ratemap_ready(config)
+            if missing:
+                st.error(
+                    "Cannot run the comparison — exchange rates unavailable for: "
+                    + ", ".join(missing)
+                    + ". Refresh the Exchange Rate Board or set manual overrides first."
+                )
+                return
+            with st.spinner("Running the three-project comparison and optimisation..."):
+                out = tp.compare_projects(config)
+            st.session_state["tp_result"] = out
+            st.session_state["tp_result_ccy"] = fx.CCY_LABELS[comparison_currency]
+
+    result = st.session_state.get("tp_result")
+    if result is not None:
+        _render_tp_result(result, st.session_state.get("tp_result_ccy", "USD"))
+
+
+# ---------------------------------------------------------------------------
+# Tab 1 — Single-Project Analysis
+# ---------------------------------------------------------------------------
+
+def render_single_project_tab():
     # Global results container
     results = None
     scenarios = None
@@ -649,8 +1046,8 @@ def main():
         inputs = sidebar_input_form()
 
     if inputs is None:
-        st.info("Please enter project details or upload a file. Analysis runs after submitting the form.")
-        st.stop()
+        st.info("Please enter project details in the sidebar or upload a file. Analysis runs after submitting the form.")
+        return
 
     # Validate
     validation_data = {
@@ -668,7 +1065,7 @@ def main():
     vres = dv.validate_project_inputs(validation_data)
     if not vres.is_valid:
         st.error("Input validation failed — please correct the following:" + "\n".join(f"\n- {e}" for e in vres.errors))
-        st.stop()
+        return
     for w in vres.warnings:
         st.warning(w)
 
@@ -712,13 +1109,33 @@ def main():
             A professional, industry-independent decision-support tool for evaluating capital projects.
 
             * Modules: `app.py`, `calculations.py`, `risk_analysis.py`, `scenario_analysis.py`,
-              `report_generator.py`, `email_service.py`, `data_validation.py`, `test_cases.py`.
+              `report_generator.py`, `email_service.py`, `data_validation.py`, `fx_rates.py`,
+              `three_project.py`, `test_cases.py`.
             * No results are hard-coded — every figure is computed dynamically from the inputs.
             * Reports are generated as PDF, Word, and Excel; email delivery uses SMTP credentials
               supplied via the SMTP settings form or environment variables. The report can be
               emailed to any recipient address.
             """
         )
+
+
+def main():
+    st.title("Financial Engineering Investment Decision Agent")
+    st.caption("Industry-independent capital budgeting, DCF, risk, scenario and decision engine.")
+
+    tab_single, tab_fx, tab_three = st.tabs(
+        [
+            "Single-Project Analysis",
+            "Exchange Rate Board (USD/ZAR/ZiG)",
+            "Three-Project Comparison",
+        ]
+    )
+    with tab_single:
+        render_single_project_tab()
+    with tab_fx:
+        render_fx_board()
+    with tab_three:
+        render_three_project()
 
 
 if __name__ == "__main__":
